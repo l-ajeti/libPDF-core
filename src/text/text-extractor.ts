@@ -16,6 +16,41 @@ import type { PdfFont } from "#src/fonts/pdf-font";
 import { TextState } from "./text-state";
 import type { ExtractedChar } from "./types";
 
+/** Maximum form XObject nesting depth, to guard against cyclic references. */
+const MAX_FORM_DEPTH = 16;
+
+/**
+ * Resolves the named resources of a content stream (fonts and XObjects).
+ *
+ * Each form XObject carries its own resource dictionary, so a resolver is
+ * scoped to a single content stream.
+ */
+export interface ResourceResolver {
+  /**
+   * Resolve a font name to a PdfFont object.
+   * Font names are keys in the /Resources/Font dictionary (e.g., "F1", "TT0").
+   */
+  resolveFont: (name: string) => PdfFont | null;
+
+  /**
+   * Resolve an XObject name (key in /Resources/XObject) to a form XObject.
+   * Returns null for image XObjects or names that cannot be resolved.
+   */
+  resolveXObject: (name: string) => FormXObject | null;
+}
+
+/**
+ * A form XObject whose content stream should be processed inline.
+ */
+export interface FormXObject {
+  /** Decoded content stream bytes of the form. */
+  bytes: Uint8Array;
+  /** Optional /Matrix mapping form space into the current coordinate space. */
+  matrix?: readonly [number, number, number, number, number, number];
+  /** Resources scoped to the form's own content stream. */
+  resources: ResourceResolver;
+}
+
 /**
  * Options for text extraction.
  */
@@ -25,18 +60,32 @@ export interface TextExtractorOptions {
    * Font names are keys in the /Resources/Font dictionary (e.g., "F1", "TT0").
    */
   resolveFont: (name: string) => PdfFont | null;
+
+  /**
+   * Resolve an XObject name to a form XObject so its text can be extracted.
+   * Optional — when omitted, `Do` operators are ignored.
+   */
+  resolveXObject?: (name: string) => FormXObject | null;
 }
 
 /**
  * Extracts text from PDF content streams.
  */
 export class TextExtractor {
-  private readonly resolveFont: (name: string) => PdfFont | null;
   private readonly state: TextState;
   private readonly chars: ExtractedChar[] = [];
 
+  /** Resources for the content stream currently being processed. */
+  private resources: ResourceResolver;
+
+  /** Current form XObject nesting depth. */
+  private formDepth = 0;
+
   constructor(options: TextExtractorOptions) {
-    this.resolveFont = options.resolveFont;
+    this.resources = {
+      resolveFont: options.resolveFont,
+      resolveXObject: options.resolveXObject ?? (() => null),
+    };
     this.state = new TextState();
   }
 
@@ -47,14 +96,21 @@ export class TextExtractor {
    * @returns Array of extracted characters with positions
    */
   extract(contentBytes: Uint8Array): ExtractedChar[] {
+    this.runContent(contentBytes);
+
+    return this.chars;
+  }
+
+  /**
+   * Parse and process a content stream's operations with the active resources.
+   */
+  private runContent(contentBytes: Uint8Array): void {
     const parser = new ContentStreamParser(contentBytes);
     const { operations } = parser.parse();
 
     for (const op of operations) {
       this.processOperation(op);
     }
-
-    return this.chars;
   }
 
   /**
@@ -169,6 +225,74 @@ export class TextExtractor {
         this.state.moveToNextLine();
         this.handleTj([operands[2]]);
         break;
+
+      // XObject invocation
+      case "Do":
+        this.handleDo(operands);
+        break;
+    }
+  }
+
+  /**
+   * Handle Do (paint XObject) operator.
+   *
+   * Form XObjects carry their own content stream and resources, so any text
+   * inside them is extracted by processing the form inline. Image XObjects
+   * resolve to null and are skipped.
+   */
+  private handleDo(operands: ContentToken[]): void {
+    const name = this.getName(operands[0]);
+
+    if (!name) {
+      return;
+    }
+
+    const form = this.resources.resolveXObject(name);
+
+    if (!form) {
+      return;
+    }
+
+    this.runForm(form);
+  }
+
+  /**
+   * Process a form XObject's content stream inline.
+   *
+   * Per the PDF spec (8.10.1), invoking a form is equivalent to wrapping its
+   * content in q/Q with the form's /Matrix concatenated onto the CTM. The
+   * caller's state is fully snapshotted and restored so that imbalanced q/Q or
+   * leftover text state inside the form cannot affect the rest of the page.
+   */
+  private runForm(form: FormXObject): void {
+    if (this.formDepth >= MAX_FORM_DEPTH) {
+      return;
+    }
+
+    this.formDepth += 1;
+
+    const snapshot = this.state.captureState();
+    const previousResources = this.resources;
+
+    if (form.matrix) {
+      this.state.concatMatrix(
+        form.matrix[0],
+        form.matrix[1],
+        form.matrix[2],
+        form.matrix[3],
+        form.matrix[4],
+        form.matrix[5],
+      );
+    }
+
+    this.resources = form.resources;
+
+    try {
+      this.runContent(form.bytes);
+    } finally {
+      this.resources = previousResources;
+      this.state.restoreState(snapshot);
+      this.formDepth -= 1;
     }
   }
 
@@ -194,7 +318,7 @@ export class TextExtractor {
     const fontSize = this.getNumber(operands[1]);
 
     if (fontName) {
-      const font = this.resolveFont(fontName);
+      const font = this.resources.resolveFont(fontName);
       this.state.font = font;
     }
 

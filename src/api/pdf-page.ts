@@ -117,6 +117,7 @@ import {
   showText,
 } from "#src/helpers/operators";
 import * as operatorHelpers from "#src/helpers/operators";
+import type { RefResolver } from "#src/helpers/types";
 import type { PDFImage } from "#src/images/pdf-image";
 import { PdfArray } from "#src/objects/pdf-array";
 import { PdfDict } from "#src/objects/pdf-dict";
@@ -126,7 +127,7 @@ import { PdfRef } from "#src/objects/pdf-ref";
 import { PdfStream } from "#src/objects/pdf-stream";
 import { PdfString } from "#src/objects/pdf-string";
 import { getPlainText, groupCharsIntoLines } from "#src/text/line-grouper";
-import { TextExtractor } from "#src/text/text-extractor";
+import { type FormXObject, type ResourceResolver, TextExtractor } from "#src/text/text-extractor";
 import { searchPage } from "#src/text/text-search";
 import type { ExtractTextOptions, FindTextOptions, PageText, TextMatch } from "#src/text/types";
 
@@ -2817,11 +2818,14 @@ export class PDFPage {
     // Get content stream bytes
     const contentBytes = this.getContentBytes();
 
-    // Create font resolver
-    const resolveFont = this.createFontResolver();
+    // Build a resource resolver for fonts and form XObjects
+    const resources = this.createResourceResolver(this.resolveInheritedResources());
 
     // Extract characters
-    const extractor = new TextExtractor({ resolveFont });
+    const extractor = new TextExtractor({
+      resolveFont: resources.resolveFont,
+      resolveXObject: resources.resolveXObject,
+    });
     const chars = extractor.extract(contentBytes);
 
     // Group into lines and spans
@@ -2959,16 +2963,45 @@ export class PDFPage {
   }
 
   /**
-   * Create a font resolver function for text extraction.
+   * Memoized resource resolvers, keyed by Resources dictionary identity.
+   * Shared across nested form XObjects to avoid rebuilding font caches and to
+   * break cyclic XObject references.
    */
-  private createFontResolver(): (name: string) => PdfFont | null {
-    // Get the page's Font resources (may be a ref or inherited from parent)
-    const resourcesDict = this.resolveInheritedResources();
+  private readonly _resourceResolverCache = new Map<PdfDict, ResourceResolver>();
 
+  /**
+   * Build a resource resolver (fonts + form XObjects) for a Resources dict.
+   *
+   * Form XObjects carry their own Resources, so resolvers are scoped per
+   * Resources dictionary. Resolvers are memoized by dictionary identity, both
+   * to avoid rebuilding font caches for repeated XObjects and so that cyclic
+   * resource references resolve to the same instance. (The XObject resolver
+   * recurses lazily, so building one resolver never builds another.)
+   */
+  private createResourceResolver(resourcesDict: PdfDict | null): ResourceResolver {
     if (!resourcesDict) {
-      return () => null;
+      return { resolveFont: () => null, resolveXObject: () => null };
     }
 
+    const cached = this._resourceResolverCache.get(resourcesDict);
+
+    if (cached) {
+      return cached;
+    }
+
+    const resolver: ResourceResolver = {
+      resolveFont: this.createFontResolver(resourcesDict),
+      resolveXObject: this.createXObjectResolver(resourcesDict),
+    };
+    this._resourceResolverCache.set(resourcesDict, resolver);
+
+    return resolver;
+  }
+
+  /**
+   * Create a font resolver function for a given Resources dictionary.
+   */
+  private createFontResolver(resourcesDict: PdfDict): (name: string) => PdfFont | null {
     const font = resourcesDict.getDict("Font", this.ctx.resolve.bind(this.ctx));
 
     if (!font) {
@@ -3014,5 +3047,86 @@ export class PDFPage {
     return (name: string): PdfFont | null => {
       return fontCache.get(name) ?? null;
     };
+  }
+
+  /**
+   * Create a form-XObject resolver for a given Resources dictionary.
+   *
+   * Only form XObjects (Subtype /Form) carry extractable text; image XObjects
+   * resolve to null so the extractor skips them.
+   */
+  private createXObjectResolver(resourcesDict: PdfDict): (name: string) => FormXObject | null {
+    const resolve = this.ctx.resolve.bind(this.ctx);
+    const xobjects = resourcesDict.getDict("XObject", resolve);
+
+    if (!xobjects) {
+      return () => null;
+    }
+
+    const cache = new Map<string, FormXObject | null>();
+
+    return (name: string): FormXObject | null => {
+      const existing = cache.get(name);
+
+      if (existing !== undefined) {
+        return existing;
+      }
+
+      let result: FormXObject | null = null;
+      const entry = xobjects.get(name, resolve);
+
+      if (entry instanceof PdfStream && entry.getName("Subtype", resolve)?.value === "Form") {
+        let bytes: Uint8Array;
+
+        try {
+          bytes = entry.getDecodedData();
+        } catch {
+          // Undecodable stream — treat as empty rather than throwing.
+          bytes = new Uint8Array(0);
+        }
+
+        // A form's content is processed with its own Resources, falling back to
+        // the enclosing resources when the form omits them (lenient handling).
+        const formResources = entry.getDict("Resources", resolve) ?? resourcesDict;
+
+        result = {
+          bytes,
+          matrix: this.readMatrix(entry, resolve),
+          resources: this.createResourceResolver(formResources),
+        };
+      }
+
+      cache.set(name, result);
+
+      return result;
+    };
+  }
+
+  /**
+   * Read a 6-element /Matrix from an XObject dictionary, if present and valid.
+   */
+  private readMatrix(
+    dict: PdfDict,
+    resolve: RefResolver,
+  ): [number, number, number, number, number, number] | undefined {
+    const array = dict.getArray("Matrix", resolve);
+
+    if (!array || array.length !== 6) {
+      return undefined;
+    }
+
+    const values: number[] = [];
+
+    for (let i = 0; i < 6; i++) {
+      const value = array.at(i, resolve);
+
+      if (value?.type !== "number") {
+        return undefined;
+      }
+
+      values.push(value.value);
+    }
+
+    return [values[0], values[1], values[2], values[3], values[4], values[5]];
   }
 }
