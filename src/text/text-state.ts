@@ -38,6 +38,26 @@ export interface TextStateParams {
 }
 
 /**
+ * A full snapshot of the rendering state, used to isolate nested content
+ * (e.g. form XObjects) so that imbalanced q/Q inside them cannot corrupt the
+ * caller's state.
+ */
+export interface StateSnapshot {
+  ctm: Matrix;
+  tm: Matrix;
+  tlm: Matrix;
+  font: PdfFont | null;
+  fontSize: number;
+  charSpacing: number;
+  wordSpacing: number;
+  horizontalScale: number;
+  leading: number;
+  rise: number;
+  renderMode: number;
+  graphicsStackDepth: number;
+}
+
+/**
  * Tracks all text rendering state during content stream processing.
  */
 export class TextState {
@@ -330,6 +350,54 @@ export class TextState {
       height: maxY - minY,
       baseline: baselinePoint.y,
     };
+  }
+
+  /**
+   * Capture a full snapshot of the current rendering state.
+   *
+   * Used to isolate nested content streams (form XObjects): the snapshot
+   * records the graphics-state stack depth so it can be unwound even if the
+   * nested content has unbalanced q/Q operators.
+   */
+  captureState(): StateSnapshot {
+    return {
+      ctm: this.ctm.clone(),
+      tm: this.tm.clone(),
+      tlm: this.tlm.clone(),
+      font: this.font,
+      fontSize: this.fontSize,
+      charSpacing: this.charSpacing,
+      wordSpacing: this.wordSpacing,
+      horizontalScale: this.horizontalScale,
+      leading: this.leading,
+      rise: this.rise,
+      renderMode: this.renderMode,
+      graphicsStackDepth: this.graphicsStateStack.length,
+    };
+  }
+
+  /**
+   * Restore a snapshot captured by {@link captureState}.
+   *
+   * Any graphics-state entries pushed since the snapshot are discarded, so a
+   * nested stream with extra q (or missing Q) operators cannot leak state.
+   */
+  restoreState(snapshot: StateSnapshot): void {
+    this.ctm = snapshot.ctm;
+    this.tm = snapshot.tm;
+    this.tlm = snapshot.tlm;
+    this.font = snapshot.font;
+    this.fontSize = snapshot.fontSize;
+    this.charSpacing = snapshot.charSpacing;
+    this.wordSpacing = snapshot.wordSpacing;
+    this.horizontalScale = snapshot.horizontalScale;
+    this.leading = snapshot.leading;
+    this.rise = snapshot.rise;
+    this.renderMode = snapshot.renderMode;
+
+    if (this.graphicsStateStack.length > snapshot.graphicsStackDepth) {
+      this.graphicsStateStack.length = snapshot.graphicsStackDepth;
+    }
   }
 
   /**

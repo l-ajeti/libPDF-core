@@ -70,6 +70,20 @@ describe("Text Extraction Integration", () => {
     });
   });
 
+  describe("form XObjects", () => {
+    it("extracts text nested inside a form XObject", async () => {
+      // The page draws all of its text via a form XObject (/Fm0 Do) that
+      // carries its own font resources, so extraction must recurse into it.
+      const bytes = await loadFixture("text", "form-xobject-text.pdf");
+      const pdf = await PDF.load(bytes);
+      const page = pdf.getPage(0);
+
+      const pageText = page!.extractText();
+
+      expect(pageText.text).toContain("FormXObjectText");
+    });
+  });
+
   describe("document-wide extractText", () => {
     it("extracts text from all pages", async () => {
       const bytes = await loadFixture("text", "openoffice-test-document.pdf");
